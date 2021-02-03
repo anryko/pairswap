@@ -39,4 +39,8 @@ True
 AttributeDict({'blockHash'...
 >>> pair.balances
 (1.781855709171742, 149.55144756540705)
+>>> pair.wait(pair.unswap(50, gas=200000, gas_price=gas_price))
+AttributeDict({'blockHash'...
+>>> pair.balances
+(1.862722511685864, 99.55144756540705)
 ```
