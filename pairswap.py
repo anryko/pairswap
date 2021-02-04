@@ -3,6 +3,8 @@ import json
 import logging
 import time
 
+from datetime import datetime
+
 from typing import (
     Callable,
     Dict,
@@ -30,7 +32,7 @@ TokWei = int
 Token = float
 TxHash = str
 
-log = logging.getLogger(__name__)
+log = logging.getLogger('pairswap')
 
 
 class Utils:
@@ -184,6 +186,21 @@ class ETHPair(PairswapClient):
             abi=PAIR_ABI
         )
         self.token_symbol = self.token_contract.functions.symbol().call()
+        self.token_decimals = self.token_contract.functions.decimals().call()
+
+    @staticmethod
+    def _eth_to_wei(amount: Ether) -> Wei:
+        return Wei(Web3.toWei(amount, 'ether'))
+
+    @staticmethod
+    def _wei_to_eth(amount: Wei) -> Ether:
+        return Ether(Web3.fromWei(amount, 'ether'))
+
+    def _token_to_tokwei(self, amount: Token) -> TokWei:
+        return TokWei(amount * (10**self.token_decimals))
+
+    def _tokwei_to_token(self, amount: TokWei) -> Token:
+        return Token(amount / (10**self.token_decimals))
 
     @property
     def weth_address(self) -> str:
@@ -194,14 +211,14 @@ class ETHPair(PairswapClient):
         """ Pair ETH balance.
         """
         balance: Wei = self.conn.eth.getBalance(self.address)
-        return Ether(Web3.fromWei(balance, 'ether'))
+        return self._wei_to_eth(balance)
 
     @property
     def token_balance(self) -> Token:
         """ Pair token balance.
         """
         balance: TokWei = self.token_contract.functions.balanceOf(self.address).call()
-        return Token(Web3.fromWei(balance, 'ether'))
+        return self._tokwei_to_token(balance)
 
     @property
     def balances(self) -> Tuple[Ether, Token]:
@@ -230,7 +247,7 @@ class ETHPair(PairswapClient):
         """
         return int(time.time()) + self.tx_timeout
 
-    def _get_token_price_in_wei(self, amount: TokWei) -> Wei:
+    def _tokwei_price_in_wei(self, amount: TokWei) -> Wei:
         """ Amount of tokens you can expect to get for supplied amount of Wei.
         """
         return self.router.functions.getAmountsIn(
@@ -238,7 +255,7 @@ class ETHPair(PairswapClient):
             [self.weth_address, self.token]
         ).call()[0]
 
-    def _get_wei_price_in_token(self, amount: Wei) -> TokWei:
+    def _wei_price_in_tokwei(self, amount: Wei) -> TokWei:
         """ Amount of Wei you can expect to get for supplied amount of tokens.
         """
         return self.router.functions.getAmountsOut(
@@ -247,24 +264,22 @@ class ETHPair(PairswapClient):
         ).call()[-1]
 
     @property
-    def price(self) -> Token:
-        """ Price of one ETH in Token.
+    def price(self, amount: Ether = 1) -> Token:
+        """ Price of ETH in Token.
         """
-        return Token(
-            Web3.fromWei(
-                self._get_wei_price_in_token(Web3.toWei(1, 'ether')),
-                'ether'
+        return self._tokwei_to_token(
+            self._wei_price_in_tokwei(
+                self._eth_to_wei(amount)
             )
         )
 
     @property
-    def token_price(self) -> Ether:
-        """ Price of one token in ETH.
+    def token_price(self, amount: Token = 1) -> Ether:
+        """ Price of Token in ETH.
         """
-        return Ether(
-            Web3.fromWei(
-                self._get_token_price_in_wei(Web3.toWei(1, 'ether')),
-                'ether'
+        return self._wei_to_eth(
+            self._tokwei_price_in_wei(
+                self._token_to_tokwei(amount)
             )
         )
 
@@ -294,13 +309,23 @@ class ETHPair(PairswapClient):
         nonce: Optional[int] = None,
     ) -> None:
         if self.is_token_approved(max_approval):
-            log.debug("The {max_approval} of {self.token_symbol} is already approved for transfer")
+            log.debug(
+                (
+                    f"The {self._tokwei_to_token(max_approval)} of "
+                    f"{self.token_symbol} is already approved for transfer"
+                )
+            )
             return
 
-        log.info(f"Approving {max_approval} of {self.token_symbol} for transfer")
-        log.debug(f"Approval gas: {gas}")
-        log.debug(f"Approval gas price: {gas_price}")
-        log.debug(f"Approval nonce: {nonce}")
+        log.info(
+            (
+                f"Approving {self._tokwei_to_token(max_approval)} "
+                f"of {self.token_symbol} for transfer"
+            )
+        )
+        log.debug(f"Approval gas: {gas or self.tx_gas}")
+        log.debug(f"Approval gas price: {gas_price or self.tx_gas_price} Wei")
+        log.debug(f"Approval nonce: {nonce or 'Default'}")
 
         erc20_contract = self.conn.eth.contract(
             address=self.token,
@@ -324,7 +349,7 @@ class ETHPair(PairswapClient):
         )
         tx_hash = self._submit_tx(func, params)
 
-        timeout = 3600  # 1h
+        timeout = 3600  # 1 hour
         timer_start = time.monotonic()
         self.wait(tx_hash, timeout)
 
@@ -335,7 +360,12 @@ class ETHPair(PairswapClient):
         ):
             time.sleep(0.5)
 
-        log.info(f"The {max_approval} of {self.token_symbol} was approved for transfer")
+        log.info(
+            (
+                f"The {self._tokwei_to_token(max_approval)} of "
+                f"{self.token_symbol} was approved for transfer"
+            )
+        )
 
     def swap(
         self,
@@ -346,10 +376,10 @@ class ETHPair(PairswapClient):
     ) -> TxHash:
         """ Swap ETH to Token.
         """
-        swap_amount: Wei = Web3.toWei(amount, 'ether')
+        swap_amount: Wei = self._eth_to_wei(amount)
 
         amount_out_min: TokWei = TokWei(
-            (1 - self.max_slippage) * self._get_wei_price_in_token(swap_amount)
+            (1 - self.max_slippage) * self._wei_price_in_tokwei(swap_amount)
         )
         path = [self.weth_address, self.token]
         to_address = self.address
@@ -358,15 +388,15 @@ class ETHPair(PairswapClient):
         log.info(
             (
                 f"Swapping {amount} ETH for a minimum of "
-                f"{Web3.fromWei(amount_out_min, 'ether')} {self.token_symbol}"
+                f"{self._tokwei_to_token(amount_out_min)} {self.token_symbol}"
             )
         )
         log.debug(f"Swap path: {path}")
         log.debug(f"Swap address: {to_address}")
-        log.debug(f"Swap deadline: {deadline}")
-        log.debug(f"Swap gas: {gas}")
-        log.debug(f"Swap gas price: {gas_price} Wei")
-        log.debug(f"Swap nonce: {gas_price}")
+        log.debug(f"Swap deadline: {datetime.fromtimestamp(deadline)}")
+        log.debug(f"Swap gas: {gas or self.tx_gas_price}")
+        log.debug(f"Swap gas price: {gas_price or self.tx_gas} Wei")
+        log.debug(f"Swap nonce: {nonce or 'Default'}")
 
         func = self.router.functions.swapExactETHForTokens(
             amount_out_min,
@@ -392,7 +422,8 @@ class ETHPair(PairswapClient):
     ) -> TxHash:
         """ Swap Token to ETH.
         """
-        unswap_amount: TokWei = Web3.toWei(amount, 'ether')
+        unswap_amount: TokWei = self._token_to_tokwei(amount)
+
         self.approve_token(
             max_approval=unswap_amount,
             gas=gas,
@@ -401,7 +432,7 @@ class ETHPair(PairswapClient):
         )
 
         amount_out_min: Wei = Wei(
-            (1 - self.max_slippage) * self._get_token_price_in_wei(unswap_amount)
+            (1 - self.max_slippage) * self._tokwei_price_in_wei(unswap_amount)
         )
         path = [self.token, self.weth_address]
         to_address = self.address
@@ -410,15 +441,15 @@ class ETHPair(PairswapClient):
         log.info(
             (
                 f"Unswapping {amount} {self.token_symbol} for a minimum of "
-                f"{Web3.fromWei(amount_out_min, 'ether')} ETH"
+                f"{self._wei_to_eth(amount_out_min)} ETH"
             )
         )
         log.debug(f"Unswap path: {path}")
         log.debug(f"Unswap address: {to_address}")
-        log.debug(f"Unswap deadline: {deadline}")
-        log.debug(f"Unswap gas: {gas}")
-        log.debug(f"Unswap gas price: {gas_price} Wei")
-        log.debug(f"Unswap nonce: {gas_price}")
+        log.debug(f"Unswap deadline: {datetime.fromtimestamp(deadline)}")
+        log.debug(f"Unswap gas: {gas or self.tx_gas}")
+        log.debug(f"Unswap gas price: {gas_price or self.tx_gas_price} Wei")
+        log.debug(f"Unswap nonce: {nonce or 'Default'}")
 
         func = self.router.functions.swapExactTokensForETH(
             unswap_amount,
